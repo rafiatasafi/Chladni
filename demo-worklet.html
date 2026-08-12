@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Chord Quest — Pitch Detector (AudioWorklet)</title>
+<style>
+  :root {
+    --bg: #0d0f12; --panel: #15181d; --line: #262b33;
+    --text: #e8eaed; --dim: #7a8290;
+    --accent: #5ee6a8; --warn: #e6b95e;
+    --mono: "SF Mono", "JetBrains Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg);
+    color: var(--text); font-family: var(--mono);
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .wrap { width: 100%; max-width: 520px; }
+  .eyebrow { color: var(--dim); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 4px; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 20px 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 28px; }
+  button { font-family: var(--mono); font-size: 13px; background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 10px 16px; cursor: pointer; transition: border-color .15s; }
+  button:hover { border-color: var(--accent); }
+  button.active { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+  .readout { margin-top: 28px; text-align: center; }
+  .note-name { font-size: 56px; font-weight: 700; line-height: 1; }
+  .octave { font-size: 24px; color: var(--dim); vertical-align: super; }
+  .freq { color: var(--dim); font-size: 13px; margin-top: 8px; }
+  .tuner-track { position: relative; height: 6px; background: var(--line); border-radius: 3px; margin: 20px 0 6px; }
+  .tuner-center { position: absolute; left: 50%; top: -6px; width: 1px; height: 18px; background: var(--dim); transform: translateX(-50%); }
+  .tuner-needle { position: absolute; top: -4px; width: 4px; height: 14px; border-radius: 2px; background: var(--accent); transform: translateX(-50%); transition: left .06s linear, background .1s; }
+  .cents-label { text-align: center; font-size: 12px; color: var(--dim); }
+  .status { margin-top: 20px; font-size: 12px; color: var(--dim); text-align: center; min-height: 16px; }
+  .latency { font-size: 11px; color: var(--dim); text-align: center; margin-top: 6px; font-family: var(--mono); }
+  .footer-note { margin-top: 20px; font-size: 11px; color: var(--dim); line-height: 1.6; border-top: 1px solid var(--line); padding-top: 14px; }
+  .badge { display: inline-block; font-size: 10px; padding: 2px 7px; border-radius: 4px; background: #1a2e24; color: var(--accent); margin-left: 8px; vertical-align: middle; letter-spacing: .05em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="eyebrow">Chord Quest / DSP prototype</div>
+  <h1>Live pitch detector <span class="badge">AudioWorklet</span></h1>
+
+  <div class="panel">
+    <button id="toggleBtn">Start listening</button>
+
+    <div class="readout">
+      <div class="note-name"><span id="noteName">—</span><span class="octave" id="octave"></span></div>
+      <div class="freq" id="freq">0.0 Hz</div>
+    </div>
+
+    <div class="tuner-track">
+      <div class="tuner-center"></div>
+      <div class="tuner-needle" id="needle" style="left:50%"></div>
+    </div>
+    <div class="cents-label" id="centsLabel">&nbsp;</div>
+
+    <div class="status" id="status">Mic is off.</div>
+    <div class="latency" id="latency">&nbsp;</div>
+  </div>
+
+  <div class="footer-note">
+    YIN now runs on the <strong>audio rendering thread</strong> via AudioWorkletProcessor.
+    The main thread only receives a <code>postMessage</code> with the result — no audio
+    processing happens here. This means UI work (rAF, DOM updates, even a heavy
+    Chladni render) can't cause pitch detection to glitch or drop frames.<br><br>
+    Next: HPS polyphonic chord detection in a second processor.
+  </div>
+</div>
+
+<script>
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+function frequencyToNote(freq) {
+  const mf   = 12 * Math.log2(freq / 440) + 69;
+  const midi = Math.round(mf);
+  const cents = Math.round((mf - midi) * 100);
+  return {
+    noteName: NOTE_NAMES[((midi % 12) + 12) % 12],
+    octave:   Math.floor(midi / 12) - 1,
+    cents,
+    freq,
+  };
+}
+
+const toggleBtn   = document.getElementById('toggleBtn');
+const noteNameEl  = document.getElementById('noteName');
+const octaveEl    = document.getElementById('octave');
+const freqEl      = document.getElementById('freq');
+const needleEl    = document.getElementById('needle');
+const centsEl     = document.getElementById('centsLabel');
+const statusEl    = document.getElementById('status');
+const latencyEl   = document.getElementById('latency');
+
+let audioCtx = null, stream = null, node = null, listening = false;
+let lastPostTime = null; // for round-trip latency measurement
+
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    }});
+  } catch (e) {
+    statusEl.textContent = 'Mic access denied: ' + e.message;
+    return;
+  }
+
+  audioCtx = new AudioContext();
+
+  // Load the processor module into the AudioWorklet scope
+  // (this is the one async step — after this, everything is real-time)
+  await audioCtx.audioWorklet.addModule('yin-processor.js');
+
+  const source = audioCtx.createMediaStreamSource(stream);
+
+  // AudioWorkletNode bridges main thread ↔ processor
+  node = new AudioWorkletNode(audioCtx, 'yin-processor');
+
+  // Results arrive here on the main thread via structured-clone postMessage
+  node.port.onmessage = (e) => {
+    const { freq, timestamp } = e.data;
+
+    // Rough round-trip latency: AudioContext time when posted vs now
+    if (lastPostTime !== null) {
+      const rtt = ((audioCtx.currentTime - lastPostTime) * 1000).toFixed(1);
+      latencyEl.textContent = `detection window ~${rtt}ms`;
+    }
+    lastPostTime = timestamp;
+
+    if (freq && freq > 60 && freq < 1400) {
+      const { noteName, octave, cents } = frequencyToNote(freq);
+      noteNameEl.textContent  = noteName;
+      octaveEl.textContent    = octave;
+      freqEl.textContent      = freq.toFixed(1) + ' Hz';
+
+      const clamped = Math.max(-50, Math.min(50, cents));
+      needleEl.style.left       = (50 + clamped) + '%';
+      needleEl.style.background = Math.abs(cents) <= 5 ? 'var(--accent)' : 'var(--warn)';
+      centsEl.textContent       = (cents > 0 ? '+' : '') + cents + ' cents';
+    } else {
+      centsEl.innerHTML = '&nbsp;';
+    }
+  };
+
+  source.connect(node);
+  // Don't connect node to destination — we don't want to hear the mic back
+  // (would cause feedback). The node runs "silently" for analysis only.
+
+  listening = true;
+  toggleBtn.textContent = 'Stop listening';
+  toggleBtn.classList.add('active');
+  statusEl.textContent = 'Listening on audio thread — play a single note.';
+}
+
+function stop() {
+  listening = false;
+  node?.disconnect();
+  stream?.getTracks().forEach(t => t.stop());
+  audioCtx?.close();
+  audioCtx = node = stream = null;
+  lastPostTime = null;
+
+  toggleBtn.textContent = 'Start listening';
+  toggleBtn.classList.remove('active');
+  statusEl.textContent   = 'Mic is off.';
+  latencyEl.innerHTML    = '&nbsp;';
+  noteNameEl.textContent = '—';
+  octaveEl.textContent   = '';
+  freqEl.textContent     = '0.0 Hz';
+  needleEl.style.left    = '50%';
+  centsEl.innerHTML      = '&nbsp;';
+}
+
+toggleBtn.addEventListener('click', () => listening ? stop() : start());
+</script>
+</body>
+</html>

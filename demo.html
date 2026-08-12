@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Chord Quest — Pitch Detector Prototype</title>
+<style>
+  :root {
+    --bg: #0d0f12;
+    --panel: #15181d;
+    --line: #262b33;
+    --text: #e8eaed;
+    --dim: #7a8290;
+    --accent: #5ee6a8;
+    --accent-dim: #2f5b47;
+    --warn: #e6b95e;
+    --mono: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .wrap { width: 100%; max-width: 520px; }
+  .eyebrow {
+    color: var(--dim);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 600;
+    margin: 0 0 20px 0;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 28px;
+  }
+  button {
+    font-family: var(--mono);
+    font-size: 13px;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 16px;
+    cursor: pointer;
+    transition: border-color 0.15s ease;
+  }
+  button:hover { border-color: var(--accent); }
+  button.active { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .readout { margin-top: 28px; text-align: center; }
+  .note-name {
+    font-size: 56px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.01em;
+  }
+  .octave { font-size: 24px; color: var(--dim); vertical-align: super; }
+  .freq { color: var(--dim); font-size: 13px; margin-top: 8px; }
+
+  .tuner-track {
+    position: relative;
+    height: 6px;
+    background: var(--line);
+    border-radius: 3px;
+    margin: 20px 0 6px 0;
+  }
+  .tuner-center {
+    position: absolute;
+    left: 50%;
+    top: -6px;
+    width: 1px;
+    height: 18px;
+    background: var(--dim);
+    transform: translateX(-50%);
+  }
+  .tuner-needle {
+    position: absolute;
+    top: -4px;
+    width: 4px;
+    height: 14px;
+    border-radius: 2px;
+    background: var(--accent);
+    transform: translateX(-50%);
+    transition: left 0.06s linear, background 0.1s ease;
+  }
+  .cents-label { text-align: center; font-size: 12px; color: var(--dim); }
+
+  .status { margin-top: 20px; font-size: 12px; color: var(--dim); text-align: center; min-height: 16px; }
+
+  .footer-note {
+    margin-top: 20px;
+    font-size: 11px;
+    color: var(--dim);
+    line-height: 1.6;
+    border-top: 1px solid var(--line);
+    padding-top: 14px;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="eyebrow">Chord Quest / DSP prototype</div>
+    <h1>Live pitch detector (YIN, single-note)</h1>
+
+    <div class="panel">
+      <button id="toggleBtn">Start listening</button>
+
+      <div class="readout">
+        <div class="note-name"><span id="noteName">—</span><span class="octave" id="octave"></span></div>
+        <div class="freq" id="freq">0.0 Hz</div>
+      </div>
+
+      <div class="tuner-track">
+        <div class="tuner-center"></div>
+        <div class="tuner-needle" id="needle" style="left: 50%;"></div>
+      </div>
+      <div class="cents-label" id="centsLabel">&nbsp;</div>
+
+      <div class="status" id="status">Mic is off.</div>
+    </div>
+
+    <div class="footer-note">
+      Single-note detection only — chords will produce a noisy/unstable
+      reading, which is expected. That's what step 3 (polyphonic /
+      Harmonic Product Spectrum) is for. This version runs the YIN loop
+      on the main thread via requestAnimationFrame; step 2 moves it into
+      an AudioWorkletProcessor for glitch-free real-time performance.
+    </div>
+  </div>
+
+  <script type="module">
+    import { yinPitchDetect, frequencyToNote } from './pitch-detector.js';
+
+    const toggleBtn = document.getElementById('toggleBtn');
+    const noteNameEl = document.getElementById('noteName');
+    const octaveEl = document.getElementById('octave');
+    const freqEl = document.getElementById('freq');
+    const needleEl = document.getElementById('needle');
+    const centsLabelEl = document.getElementById('centsLabel');
+    const statusEl = document.getElementById('status');
+
+    let audioContext = null;
+    let analyser = null;
+    let mediaStream = null;
+    let rafId = null;
+    let listening = false;
+
+    const BUFFER_SIZE = 2048; // ~46ms at 44.1kHz — good latency/accuracy tradeoff for single notes
+    const timeBuffer = new Float32Array(BUFFER_SIZE);
+
+    async function start() {
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        }});
+      } catch (err) {
+        statusEl.textContent = 'Mic access denied or unavailable: ' + err.message;
+        return;
+      }
+
+      audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(mediaStream);
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = BUFFER_SIZE;
+      source.connect(analyser);
+
+      listening = true;
+      toggleBtn.textContent = 'Stop listening';
+      toggleBtn.classList.add('active');
+      statusEl.textContent = 'Listening — play a single note.';
+      loop();
+    }
+
+    function stop() {
+      listening = false;
+      if (rafId) cancelAnimationFrame(rafId);
+      if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+      if (audioContext) audioContext.close();
+      audioContext = null;
+      analyser = null;
+      toggleBtn.textContent = 'Start listening';
+      toggleBtn.classList.remove('active');
+      statusEl.textContent = 'Mic is off.';
+      noteNameEl.textContent = '—';
+      octaveEl.textContent = '';
+      freqEl.textContent = '0.0 Hz';
+      needleEl.style.left = '50%';
+      centsLabelEl.innerHTML = '&nbsp;';
+    }
+
+    function loop() {
+      if (!listening) return;
+      analyser.getFloatTimeDomainData(timeBuffer);
+
+      const freq = yinPitchDetect(timeBuffer, audioContext.sampleRate);
+
+      if (freq && freq > 60 && freq < 1200) {
+        const { noteName, octave, cents } = frequencyToNote(freq);
+        noteNameEl.textContent = noteName;
+        octaveEl.textContent = octave;
+        freqEl.textContent = freq.toFixed(1) + ' Hz';
+
+        // clamp cents to +-50 for the needle display
+        const clamped = Math.max(-50, Math.min(50, cents));
+        needleEl.style.left = (50 + clamped) + '%';
+        needleEl.style.background = Math.abs(cents) <= 5
+          ? 'var(--accent)'
+          : 'var(--warn)';
+        centsLabelEl.textContent = (cents > 0 ? '+' : '') + cents + ' cents';
+      } else {
+        // no confident pitch this frame — keep last note visible but dim the cents readout
+        centsLabelEl.innerHTML = '&nbsp;';
+      }
+
+      rafId = requestAnimationFrame(loop);
+    }
+
+    toggleBtn.addEventListener('click', () => {
+      if (listening) stop(); else start();
+    });
+  </script>
+</body>
+</html>
