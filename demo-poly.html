@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Chord Quest — Polyphonic Detector</title>
+<style>
+  :root {
+    --bg: #0a0c0f; --panel: #12151a; --line: #1e2229;
+    --text: #e2e5ea; --dim: #6b7280;
+    --accent: #5ee6a8; --warn: #e6b95e; --multi: #a78bfa;
+    --mono: "SF Mono", "JetBrains Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: var(--mono); display: flex; flex-direction: column;
+    align-items: center; padding: 32px 24px; gap: 24px;
+  }
+  header { text-align: center; }
+  .eyebrow { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); margin-bottom: 6px; }
+  h1 { font-size: 20px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; width: 100%; max-width: 800px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .panel-title { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); margin-bottom: 16px; }
+
+  /* YIN panel */
+  .note-display { text-align: center; }
+  .note-big { font-size: 52px; font-weight: 700; line-height: 1; }
+  .note-oct { font-size: 22px; color: var(--dim); vertical-align: super; }
+  .note-hz { font-size: 12px; color: var(--dim); margin-top: 6px; }
+  .tuner-track { position: relative; height: 5px; background: var(--line); border-radius: 3px; margin: 16px 0 4px; }
+  .tuner-center { position: absolute; left: 50%; top: -5px; width: 1px; height: 15px; background: var(--dim); transform: translateX(-50%); }
+  .tuner-needle { position: absolute; top: -3px; width: 4px; height: 11px; border-radius: 2px; background: var(--accent); transform: translateX(-50%); transition: left .06s linear, background .1s; }
+  .cents { text-align: center; font-size: 11px; color: var(--dim); min-height: 14px; }
+
+  /* HPS panel */
+  .chord-notes { display: flex; flex-direction: column; gap: 8px; min-height: 120px; }
+  .chord-note { display: flex; align-items: center; gap: 10px; }
+  .note-pill { font-size: 13px; font-weight: 600; min-width: 36px; padding: 3px 8px; border-radius: 5px; background: #1a1f2e; color: var(--multi); text-align: center; }
+  .note-bar-wrap { flex: 1; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .note-bar { height: 100%; border-radius: 3px; background: var(--multi); transition: width .1s; }
+  .note-freq-label { font-size: 11px; color: var(--dim); min-width: 56px; text-align: right; }
+  .chord-name { font-size: 13px; color: var(--dim); margin-top: 12px; min-height: 16px; }
+
+  /* Chladni preview */
+  .chladni-wrap { width: 100%; max-width: 800px; }
+  canvas { display: block; width: 100%; height: 260px; border-radius: 12px; border: 1px solid var(--line); }
+
+  /* Controls */
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button {
+    font-family: var(--mono); font-size: 12px; background: transparent;
+    color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 14px; cursor: pointer; transition: border-color .15s;
+  }
+  button:hover { border-color: var(--accent); }
+  button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .status { font-size: 11px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <div class="eyebrow">DSP prototype · step 3</div>
+  <h1>Polyphonic pitch detector + Chladni preview</h1>
+</header>
+
+<div class="controls">
+  <button id="toggleBtn">Start listening</button>
+  <span class="status" id="status">Mic off</span>
+</div>
+
+<div class="grid">
+  <!-- YIN: single note / tuner -->
+  <div class="panel">
+    <div class="panel-title">YIN — fundamental</div>
+    <div class="note-display">
+      <div class="note-big"><span id="yinNote">—</span><span class="note-oct" id="yinOct"></span></div>
+      <div class="note-hz" id="yinHz">— Hz</div>
+    </div>
+    <div class="tuner-track">
+      <div class="tuner-center"></div>
+      <div class="tuner-needle" id="needle" style="left:50%"></div>
+    </div>
+    <div class="cents" id="cents">&nbsp;</div>
+  </div>
+
+  <!-- HPS: chord notes -->
+  <div class="panel">
+    <div class="panel-title">HPS — polyphonic</div>
+    <div class="chord-notes" id="chordNotes">
+      <span style="font-size:12px;color:var(--dim)">play a chord...</span>
+    </div>
+    <div class="chord-name" id="chordName">&nbsp;</div>
+  </div>
+</div>
+
+<!-- Chladni canvas -->
+<div class="chladni-wrap">
+  <canvas id="chladni"></canvas>
+</div>
+
+<script>
+// ─── Note utils ───────────────────────────────────────────────────────────────
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+function freqToNote(freq) {
+  const mf   = 12 * Math.log2(freq / 440) + 69;
+  const midi = Math.round(mf);
+  return {
+    name:  NOTE_NAMES[((midi % 12) + 12) % 12],
+    oct:   Math.floor(midi / 12) - 1,
+    cents: Math.round((mf - midi) * 100),
+    midi,
+  };
+}
+
+// Very basic chord name lookup from a set of note classes
+const CHORD_PATTERNS = {
+  '0,4,7':    'maj',  '0,3,7':  'min',  '0,3,6':   'dim',
+  '0,4,8':    'aug',  '0,5,7':  'sus4', '0,2,7':   'sus2',
+  '0,4,7,11': 'maj7', '0,3,7,10':'min7','0,4,7,10':'dom7',
+};
+
+function identifyChord(freqs) {
+  if (freqs.length < 2) return '';
+  const classes = [...new Set(freqs.map(f => freqToNote(f).midi % 12))].sort((a,b)=>a-b);
+  const root = classes[0];
+  const intervals = classes.map(c => (c - root + 12) % 12).sort((a,b)=>a-b).join(',');
+  const quality = CHORD_PATTERNS[intervals];
+  if (!quality) return '';
+  return NOTE_NAMES[root] + ' ' + quality;
+}
+
+// ─── Chladni renderer ─────────────────────────────────────────────────────────
+const chladni = document.getElementById('chladni');
+const ctx2d   = chladni.getContext('2d');
+let chladniFreqs = [];
+let chladniRaf   = null;
+
+function freqToModes(freq) {
+  // Map frequency to nearest (m,n) mode pair using f ∝ (m²+n²)
+  // Base: 55Hz ≈ (1,1) → scale = freq/55
+  const scale = freq / 55;
+  const target = scale;
+  let best = [1, 2], bestDiff = Infinity;
+  for (let m = 1; m <= 8; m++) {
+    for (let n = 1; n <= 8; n++) {
+      if (m === n) continue; // same-axis modes produce grid, less interesting
+      const diff = Math.abs(m * m + n * n - target * 4);
+      if (diff < bestDiff) { bestDiff = diff; best = [m, n]; }
+    }
+  }
+  return best;
+}
+
+function drawChladni() {
+  const W = chladni.width, H = chladni.height;
+  ctx2d.fillStyle = '#0a0c0f';
+  ctx2d.fillRect(0, 0, W, H);
+
+  if (chladniFreqs.length === 0) {
+    ctx2d.fillStyle = '#1e2229';
+    ctx2d.font = '13px SF Mono, monospace';
+    ctx2d.textAlign = 'center';
+    ctx2d.fillText('Chladni pattern appears here when audio is detected', W/2, H/2);
+    return;
+  }
+
+  const SIZE   = Math.min(W, H) - 40;
+  const OX     = (W - SIZE) / 2;
+  const OY     = (H - SIZE) / 2;
+  const THRESH = 0.07;
+
+  // Superimpose mode patterns for each detected frequency
+  // Each frequency contributes its own (m,n) mode with an amplitude weight
+  const grains = [];
+  const ATTEMPTS = chladniFreqs.length > 1 ? 18000 : 12000;
+
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+    const x = Math.random();
+    const y = Math.random();
+
+    // Sum of all active modes (superposition)
+    let z = 0;
+    for (const { freq, magnitude } of chladniFreqs) {
+      const [m, n] = freqToModes(freq);
+      z += magnitude * Math.sin(m * Math.PI * x) * Math.sin(n * Math.PI * y);
+    }
+
+    if (Math.abs(z) < THRESH) {
+      grains.push([OX + x * SIZE, OY + y * SIZE, Math.abs(z)]);
+    }
+  }
+
+  // Draw sand grains with slight size variation
+  for (const [gx, gy, proximity] of grains) {
+    const r = 1.4 + Math.random() * 0.8;
+    // Color: brighter where multiple modes intersect (lower |z| = closer to node)
+    const alpha = 0.6 + (THRESH - proximity) / THRESH * 0.4;
+    ctx2d.beginPath();
+    ctx2d.arc(gx, gy, r, 0, Math.PI * 2);
+    ctx2d.fillStyle = chladniFreqs.length > 1
+      ? `rgba(167,139,250,${alpha})`   // purple for chords
+      : `rgba(94,230,168,${alpha})`;   // green for single note
+    ctx2d.fill();
+  }
+
+  // Mode labels
+  ctx2d.textAlign = 'left';
+  ctx2d.font = '11px SF Mono, monospace';
+  chladniFreqs.forEach(({ freq }, i) => {
+    const [m, n] = freqToModes(freq);
+    ctx2d.fillStyle = chladniFreqs.length > 1 ? '#a78bfa' : '#5ee6a8';
+    ctx2d.fillText(`(${m},${n}) ← ${freq.toFixed(0)}Hz`, OX, OY - 8 - i * 14);
+  });
+}
+
+function resizeChladni() {
+  const rect = chladni.getBoundingClientRect();
+  const dpr  = window.devicePixelRatio || 1;
+  chladni.width  = rect.width  * dpr;
+  chladni.height = rect.height * dpr;
+  ctx2d.scale(dpr, dpr);
+  chladni.style.height = '260px';
+}
+
+// Throttled redraw — don't thrash canvas on every audio message
+let chladniDirty = false;
+function scheduleChladni() {
+  if (chladniDirty) return;
+  chladniDirty = true;
+  requestAnimationFrame(() => { drawChladni(); chladniDirty = false; });
+}
+
+// ─── Audio pipeline ───────────────────────────────────────────────────────────
+let audioCtx = null, stream = null, yinNode = null, hpsNode = null;
+let listening = false;
+
+const toggleBtn = document.getElementById('toggleBtn');
+const statusEl  = document.getElementById('status');
+
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+    }});
+  } catch(e) { statusEl.textContent = 'Mic denied: ' + e.message; return; }
+
+  audioCtx = new AudioContext();
+  await audioCtx.audioWorklet.addModule('yin-processor.js');
+  await audioCtx.audioWorklet.addModule('hps-processor.js');
+
+  const source = audioCtx.createMediaStreamSource(stream);
+  yinNode = new AudioWorkletNode(audioCtx, 'yin-processor');
+  hpsNode = new AudioWorkletNode(audioCtx, 'hps-processor');
+
+  // Both processors get the same mic signal
+  source.connect(yinNode);
+  source.connect(hpsNode);
+  // Neither connects to destination (analysis only, no feedback)
+
+  // YIN result → tuner UI
+  yinNode.port.onmessage = (e) => {
+    const { freq } = e.data;
+    if (freq) {
+      const { name, oct, cents } = freqToNote(freq);
+      document.getElementById('yinNote').textContent = name;
+      document.getElementById('yinOct').textContent  = oct;
+      document.getElementById('yinHz').textContent   = freq.toFixed(1) + ' Hz';
+      const clamped = Math.max(-50, Math.min(50, cents));
+      const needle  = document.getElementById('needle');
+      needle.style.left       = (50 + clamped) + '%';
+      needle.style.background = Math.abs(cents) <= 5 ? 'var(--accent)' : 'var(--warn)';
+      document.getElementById('cents').textContent = (cents > 0 ? '+' : '') + cents + ' cents';
+    }
+  };
+
+  // HPS result → chord UI + Chladni
+  hpsNode.port.onmessage = (e) => {
+    const { notes } = e.data;
+    if (!notes || notes.length === 0) return;
+
+    // Update chord display
+    const container = document.getElementById('chordNotes');
+    container.innerHTML = '';
+    notes.forEach(({ freq, magnitude }) => {
+      const { name, oct } = freqToNote(freq);
+      const row = document.createElement('div');
+      row.className = 'chord-note';
+      row.innerHTML = `
+        <span class="note-pill">${name}${oct}</span>
+        <div class="note-bar-wrap"><div class="note-bar" style="width:${Math.round(magnitude*100)}%"></div></div>
+        <span class="note-freq-label">${freq.toFixed(1)} Hz</span>`;
+      container.appendChild(row);
+    });
+
+    // Chord name
+    document.getElementById('chordName').textContent =
+      identifyChord(notes.map(n => n.freq));
+
+    // Update Chladni with detected frequencies
+    chladniFreqs = notes.slice(0, 3); // max 3 simultaneous modes for visual clarity
+    scheduleChladni();
+  };
+
+  listening = true;
+  toggleBtn.textContent = 'Stop';
+  toggleBtn.classList.add('active');
+  statusEl.textContent = 'Listening — play a note or chord';
+}
+
+function stop() {
+  yinNode?.disconnect(); hpsNode?.disconnect();
+  stream?.getTracks().forEach(t => t.stop());
+  audioCtx?.close();
+  audioCtx = yinNode = hpsNode = stream = null;
+  listening = false;
+  chladniFreqs = [];
+  toggleBtn.textContent = 'Start listening';
+  toggleBtn.classList.remove('active');
+  statusEl.textContent = 'Mic off';
+  document.getElementById('yinNote').textContent = '—';
+  document.getElementById('yinOct').textContent  = '';
+  document.getElementById('yinHz').textContent   = '— Hz';
+  document.getElementById('needle').style.left   = '50%';
+  document.getElementById('cents').innerHTML     = '&nbsp;';
+  document.getElementById('chordNotes').innerHTML = '<span style="font-size:12px;color:var(--dim)">play a chord...</span>';
+  document.getElementById('chordName').innerHTML = '&nbsp;';
+  scheduleChladni();
+}
+
+toggleBtn.addEventListener('click', () => listening ? stop() : start());
+resizeChladni();
+drawChladni();
+window.addEventListener('resize', () => { resizeChladni(); drawChladni(); });
+</script>
+</body>
+</html>
