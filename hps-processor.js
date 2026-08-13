@@ -38,8 +38,22 @@ class HpsProcessor extends AudioWorkletProcessor {
     this.HPS_ORDER   = 5;      // number of downsampling stages (2x through 5x)
     this.MIN_FREQ    = 60;     // Hz
     this.MAX_FREQ    = 1400;   // Hz
-    this.PEAK_THRESH = 0.1;    // fraction of max HPS peak to count as a chord note
+    this.PEAK_THRESH = 0.3;    // fraction of max HPS peak to count as a chord note
     this.MAX_NOTES   = 4;      // max simultaneous fundamentals to report
+
+    // Fix 1: RMS silence gate
+    // Any input below this level is treated as silence — no notes posted.
+    // 0.01 ≈ -40dBFS, well above mic self-noise floor (~-60dBFS) but
+    // below the softest guitar note (~-20dBFS). Tunable via port message.
+    this.RMS_THRESHOLD = 0.025;
+
+    // Fix 2: temporal persistence
+    // A peak must appear in this many consecutive analysis frames before
+    // being reported. At 50% overlap on 4096 samples @ 44.1kHz, one frame
+    // ≈ 46ms, so PERSIST_FRAMES=3 requires ~140ms of stable presence.
+    this.PERSIST_FRAMES = 5;
+    // Map of "note class string" → consecutive frame count
+    this._persistence = new Map();
 
     // Ring buffer for accumulating 128-sample quanta into FFT_SIZE window
     this._ring    = new Float32Array(this.FFT_SIZE);
@@ -78,6 +92,19 @@ class HpsProcessor extends AudioWorkletProcessor {
     buf.set(this._ring.subarray(offset));
     buf.set(this._ring.subarray(0, offset), this.FFT_SIZE - offset);
 
+    // Fix 1: RMS silence gate — compute before windowing (window reduces energy)
+    let sumSq = 0;
+    for (let i = 0; i < buf.length; i++) sumSq += buf[i] * buf[i];
+    const rms = Math.sqrt(sumSq / buf.length);
+    if (rms < this.RMS_THRESHOLD) {
+      // Silent frame — decay all persistence counters so stale notes clear
+      this._persistence.forEach((v, k) => {
+        if (v <= 1) this._persistence.delete(k); else this._persistence.set(k, v - 1);
+      });
+      this.port.postMessage({ notes: [], timestamp: currentTime, rms });
+      return true;
+    }
+
     // Apply Hann window
     for (let i = 0; i < this.FFT_SIZE; i++) buf[i] *= this._window[i];
 
@@ -85,10 +112,32 @@ class HpsProcessor extends AudioWorkletProcessor {
     const mag = this._fftMagnitude(buf);
 
     // HPS
-    const hps    = this._harmonicProductSpectrum(mag);
-    const notes  = this._extractPeaks(hps);
+    const hps        = this._harmonicProductSpectrum(mag);
+    const rawPeaks   = this._extractPeaks(hps);
 
-    this.port.postMessage({ notes, timestamp: currentTime });
+    // Fix 3: merge peaks that map to the same note class (octave dedup)
+    // Two peaks within 50 cents of the same note name are the same pitch —
+    // keep the one with higher magnitude.
+    const merged = this._mergePeaks(rawPeaks);
+
+    // Fix 2: only promote peaks that have persisted for PERSIST_FRAMES frames
+    const currentKeys = new Set();
+    for (const peak of merged) {
+      const key = this._noteKey(peak.freq);
+      currentKeys.add(key);
+      this._persistence.set(key, (this._persistence.get(key) || 0) + 1);
+    }
+    // A note must persist in consecutive frames. If it disappears for even
+    // one frame, discard its history so intermittent noise cannot accumulate.
+    this._persistence.forEach((_count, key) => {
+      if (!currentKeys.has(key)) this._persistence.delete(key);
+    });
+
+    const stableNotes = merged.filter(p =>
+      (this._persistence.get(this._noteKey(p.freq)) || 0) >= this.PERSIST_FRAMES
+    );
+
+    this.port.postMessage({ notes: stableNotes, timestamp: currentTime, rms });
     return true;
   }
 
@@ -161,6 +210,32 @@ class HpsProcessor extends AudioWorkletProcessor {
       }
     }
     return hps;
+  }
+
+  // --- Note key: quantize freq to nearest semitone for persistence tracking ---
+  _noteKey(freq) {
+    const midi = Math.round(12 * Math.log2(freq / 440) + 69);
+    return midi; // integer MIDI note number — same key for enharmonic equivalents
+  }
+
+  // --- Fix 3: merge peaks within ±1 semitone of each other ---
+  // Octave errors show up as a peak at f and another at 2f (same note, different octave).
+  // We keep the lower-frequency peak when two share a note name, since HPS tends to
+  // over-report harmonics rather than miss fundamentals.
+  _mergePeaks(peaks) {
+    const SEMITONE_CENTS = 100;
+    const merged = [];
+    for (const peak of peaks) {
+      const midiFloat = 12 * Math.log2(peak.freq / 440) + 69;
+      const isDuplicate = merged.some(kept => {
+        const keptMidi = 12 * Math.log2(kept.freq / 440) + 69;
+        // same note class (mod 12) within one octave tolerance
+        return Math.abs(midiFloat - keptMidi) % 12 < 0.5 ||
+               Math.abs(midiFloat - keptMidi) < 1.0;
+      });
+      if (!isDuplicate) merged.push(peak);
+    }
+    return merged;
   }
 
   // --- Peak picking ---
