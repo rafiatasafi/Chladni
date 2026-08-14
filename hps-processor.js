@@ -38,22 +38,37 @@ class HpsProcessor extends AudioWorkletProcessor {
     this.HPS_ORDER   = 5;      // number of downsampling stages (2x through 5x)
     this.MIN_FREQ    = 60;     // Hz
     this.MAX_FREQ    = 1400;   // Hz
-    this.PEAK_THRESH = 0.3;    // fraction of max HPS peak to count as a chord note
+    this.PEAK_THRESH = 0.1;    // fraction of max HPS peak to count as a chord note
     this.MAX_NOTES   = 4;      // max simultaneous fundamentals to report
 
     // Fix 1: RMS silence gate
     // Any input below this level is treated as silence — no notes posted.
     // 0.01 ≈ -40dBFS, well above mic self-noise floor (~-60dBFS) but
     // below the softest guitar note (~-20dBFS). Tunable via port message.
-    this.RMS_THRESHOLD = 0.025;
+    this.RMS_THRESHOLD = 0.01;
 
     // Fix 2: temporal persistence
     // A peak must appear in this many consecutive analysis frames before
     // being reported. At 50% overlap on 4096 samples @ 44.1kHz, one frame
     // ≈ 46ms, so PERSIST_FRAMES=3 requires ~140ms of stable presence.
-    this.PERSIST_FRAMES = 5;
+    this.PERSIST_FRAMES = 3;
     // Map of "note class string" → consecutive frame count
     this._persistence = new Map();
+
+    // Spectral flux onset detection
+    // Noise has a stable, flat spectrum frame-to-frame. A real note being
+    // played causes a sudden increase in energy across specific harmonic bins
+    // (an "onset"). We compute spectral flux = sum of positive bin differences
+    // between consecutive frames. Below FLUX_THRESHOLD we skip HPS entirely.
+    //
+    // FLUX_THRESHOLD is empirical — 2.0 works for a quiet room with a
+    // close-mic'd guitar. Exposed via port message for runtime tuning.
+    // Once an onset is detected, ONSET_HOLD_FRAMES keeps HPS running
+    // so the full note sustain is captured, not just the attack transient.
+    this.FLUX_THRESHOLD    = 2.0;
+    this.ONSET_HOLD_FRAMES = 8;   // ~370ms hold after onset at 50% overlap
+    this._prevMag          = null; // magnitude spectrum from previous frame
+    this._onsetHoldCount   = 0;   // frames remaining in hold window
 
     // Ring buffer for accumulating 128-sample quanta into FFT_SIZE window
     this._ring    = new Float32Array(this.FFT_SIZE);
@@ -68,8 +83,10 @@ class HpsProcessor extends AudioWorkletProcessor {
     }
 
     this.port.onmessage = (e) => {
-      if (e.data.hpsOrder   !== undefined) this.HPS_ORDER   = e.data.hpsOrder;
-      if (e.data.peakThresh !== undefined) this.PEAK_THRESH = e.data.peakThresh;
+      if (e.data.hpsOrder    !== undefined) this.HPS_ORDER    = e.data.hpsOrder;
+      if (e.data.peakThresh  !== undefined) this.PEAK_THRESH  = e.data.peakThresh;
+      if (e.data.fluxThresh  !== undefined) this.FLUX_THRESHOLD = e.data.fluxThresh;
+      if (e.data.onsetHold   !== undefined) this.ONSET_HOLD_FRAMES = e.data.onsetHold;
     };
   }
 
@@ -111,6 +128,40 @@ class HpsProcessor extends AudioWorkletProcessor {
     // FFT → magnitude spectrum
     const mag = this._fftMagnitude(buf);
 
+    // Spectral flux onset detection
+    // Compare current magnitude spectrum to previous frame.
+    // flux = Σ max(|X[k]| - |X_prev[k]|, 0)  (half-wave rectified — only increases)
+    // This is the standard Dixon (2006) spectral flux formulation.
+    let flux = 0;
+    if (this._prevMag) {
+      const binHz  = sampleRate / this.FFT_SIZE;
+      const minBin = Math.ceil(this.MIN_FREQ / binHz);
+      const maxBin = Math.floor(this.MAX_FREQ / binHz);
+      for (let i = minBin; i <= maxBin; i++) {
+        const diff = mag[i] - this._prevMag[i];
+        if (diff > 0) flux += diff;
+      }
+    }
+    // Store current spectrum for next frame comparison
+    this._prevMag = mag;
+
+    // Onset gate: if flux exceeds threshold, reset hold counter
+    if (flux > this.FLUX_THRESHOLD) {
+      this._onsetHoldCount = this.ONSET_HOLD_FRAMES;
+    } else if (this._onsetHoldCount > 0) {
+      this._onsetHoldCount--;
+    }
+
+    // Skip HPS entirely if no onset and hold has expired
+    if (this._onsetHoldCount === 0) {
+      // Decay persistence so stale notes clear quickly during silence
+      this._persistence.forEach((v, k) => {
+        if (v <= 1) this._persistence.delete(k); else this._persistence.set(k, v - 1);
+      });
+      this.port.postMessage({ notes: [], timestamp: currentTime, rms, flux });
+      return true;
+    }
+
     // HPS
     const hps        = this._harmonicProductSpectrum(mag);
     const rawPeaks   = this._extractPeaks(hps);
@@ -127,17 +178,18 @@ class HpsProcessor extends AudioWorkletProcessor {
       currentKeys.add(key);
       this._persistence.set(key, (this._persistence.get(key) || 0) + 1);
     }
-    // A note must persist in consecutive frames. If it disappears for even
-    // one frame, discard its history so intermittent noise cannot accumulate.
-    this._persistence.forEach((_count, key) => {
-      if (!currentKeys.has(key)) this._persistence.delete(key);
+    // Decay keys not seen this frame
+    this._persistence.forEach((v, k) => {
+      if (!currentKeys.has(k)) {
+        if (v <= 1) this._persistence.delete(k); else this._persistence.set(k, v - 1);
+      }
     });
 
     const stableNotes = merged.filter(p =>
       (this._persistence.get(this._noteKey(p.freq)) || 0) >= this.PERSIST_FRAMES
     );
 
-    this.port.postMessage({ notes: stableNotes, timestamp: currentTime, rms });
+    this.port.postMessage({ notes: stableNotes, timestamp: currentTime, rms, flux });
     return true;
   }
 

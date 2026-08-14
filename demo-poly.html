@@ -68,6 +68,7 @@
 <div class="controls">
   <button id="toggleBtn">Start listening</button>
   <span class="status" id="status">Mic off</span>
+  <span class="status" id="fluxDisplay"></span>
 </div>
 
 <div class="grid">
@@ -326,9 +327,17 @@ async function start() {
 
   // HPS result → chord UI + Chladni
   hpsNode.port.onmessage = (e) => {
-    const { notes } = e.data;
-    // notes=[] means silence frame from processor — don't update display,
-    // let the silence timer handle clearing after SILENCE_CLEAR_MS
+    const { notes, flux } = e.data;
+
+    // Show live flux value so threshold can be calibrated empirically:
+    // quiet room noise should read 0.x–1.x, a plucked note should spike 5–50+
+    if (flux !== undefined) {
+      const fluxEl = document.getElementById('fluxDisplay');
+      fluxEl.textContent = `flux: ${flux.toFixed(2)}`;
+      fluxEl.style.color = flux > 2.0 ? 'var(--accent)' : 'var(--dim)';
+    }
+
+    // notes=[] means silence/no-onset frame — let silence timer handle clearing
     if (!notes || notes.length === 0) return;
     armSilenceTimer(); // valid chord detection — reset silence clock
 
