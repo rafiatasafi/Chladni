@@ -41,13 +41,13 @@ class HpsProcessor extends AudioWorkletProcessor {
     this.PEAK_THRESH = 0.1;    // fraction of max HPS peak to count as a chord note
     this.MAX_NOTES   = 4;      // max simultaneous fundamentals to report
 
-    // Fix 1: RMS silence gate
+    // RMS silence gate
     // Any input below this level is treated as silence — no notes posted.
     // 0.01 ≈ -40dBFS, well above mic self-noise floor (~-60dBFS) but
     // below the softest guitar note (~-20dBFS). Tunable via port message.
     this.RMS_THRESHOLD = 0.01;
 
-    // Fix 2: temporal persistence
+    // temporal persistence
     // A peak must appear in this many consecutive analysis frames before
     // being reported. At 50% overlap on 4096 samples @ 44.1kHz, one frame
     // ≈ 46ms, so PERSIST_FRAMES=3 requires ~140ms of stable presence.
@@ -166,12 +166,12 @@ class HpsProcessor extends AudioWorkletProcessor {
     const hps        = this._harmonicProductSpectrum(mag);
     const rawPeaks   = this._extractPeaks(hps);
 
-    // Fix 3: merge peaks that map to the same note class (octave dedup)
+    // merge peaks that map to the same note class (octave dedup)
     // Two peaks within 50 cents of the same note name are the same pitch —
     // keep the one with higher magnitude.
     const merged = this._mergePeaks(rawPeaks);
 
-    // Fix 2: only promote peaks that have persisted for PERSIST_FRAMES frames
+    // only promote peaks that have persisted for PERSIST_FRAMES frames
     const currentKeys = new Set();
     for (const peak of merged) {
       const key = this._noteKey(peak.freq);
@@ -270,7 +270,7 @@ class HpsProcessor extends AudioWorkletProcessor {
     return midi; // integer MIDI note number — same key for enharmonic equivalents
   }
 
-  // --- Fix 3: merge peaks within ±1 semitone of each other ---
+  // --- merge peaks within ±1 semitone of each other ---
   // Octave errors show up as a peak at f and another at 2f (same note, different octave).
   // We keep the lower-frequency peak when two share a note name, since HPS tends to
   // over-report harmonics rather than miss fundamentals.
