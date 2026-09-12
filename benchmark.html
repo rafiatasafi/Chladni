@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Chladni — Benchmark Harness</title>
+<style>
+  :root {
+    --bg: #0a0c0f; --panel: #12151a; --line: #1e2229;
+    --text: #e2e5ea; --dim: #6b7280;
+    --accent: #5ee6a8; --warn: #e6b95e; --err: #f87171;
+    --mono: "SF Mono", "JetBrains Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: var(--mono); padding: 32px 24px;
+    display: flex; flex-direction: column; align-items: center; gap: 24px;
+  }
+  h1 { font-size: 18px; font-weight: 600; }
+  .eyebrow { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); margin-bottom: 6px; text-align: center; }
+  .wrap { width: 100%; max-width: 860px; display: flex; flex-direction: column; gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .panel-title { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); margin-bottom: 14px; }
+
+  /* Ground truth table */
+  .gt-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .gt-table th { text-align: left; color: var(--dim); font-weight: 400; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  .gt-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  .gt-table tr:last-child td { border-bottom: none; }
+  .tag { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 4px; margin: 1px; }
+  .tag-note { background: #1a2e24; color: var(--accent); }
+  .tag-type { background: #1a1f2e; color: #a78bfa; }
+  input[type="file"] { display: none; }
+  .file-btn {
+    font-family: var(--mono); font-size: 11px; background: transparent;
+    color: var(--dim); border: 1px dashed var(--line); border-radius: 6px;
+    padding: 4px 10px; cursor: pointer; transition: border-color .15s, color .15s;
+  }
+  .file-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .file-btn.loaded { border-color: var(--accent); color: var(--accent); border-style: solid; }
+
+  /* Controls */
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button {
+    font-family: var(--mono); font-size: 12px; background: transparent;
+    color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 16px; cursor: pointer; transition: border-color .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .status-text { font-size: 11px; color: var(--dim); }
+
+  /* Results */
+  .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .metric { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 14px; text-align: center; }
+  .metric-val { font-size: 28px; font-weight: 700; line-height: 1; }
+  .metric-label { font-size: 10px; color: var(--dim); margin-top: 4px; letter-spacing: .05em; text-transform: uppercase; }
+  .metric-val.good { color: var(--accent); }
+  .metric-val.mid  { color: var(--warn); }
+  .metric-val.bad  { color: var(--err); }
+
+  .results-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .results-table th { text-align: left; color: var(--dim); font-weight: 400; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  .results-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  .results-table tr:last-child td { border-bottom: none; }
+  .pass { color: var(--accent); }
+  .fail { color: var(--err); }
+  .partial { color: var(--warn); }
+
+  .progress-bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 8px; }
+  .progress-fill { height: 100%; border-radius: 2px; background: var(--accent); transition: width .2s; }
+
+  .export-btn { margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<div class="eyebrow">Chladni · DSP pipeline</div>
+<h1>Benchmark Harness</h1>
+
+<div class="wrap">
+
+  <!-- Ground truth setup -->
+  <div class="panel">
+    <div class="panel-title">Ground truth samples</div>
+    <table class="gt-table">
+      <thead>
+        <tr>
+          <th>Label</th>
+          <th>Expected notes</th>
+          <th>Type</th>
+          <th>File</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="gtBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Controls -->
+  <div class="panel">
+    <div class="panel-title">Run benchmark</div>
+    <div class="controls">
+      <button class="primary" id="runBtn" disabled>Run benchmark</button>
+      <button id="clearBtn">Clear results</button>
+      <span class="status-text" id="statusText">Load audio files above to begin</span>
+    </div>
+    <div class="progress-bar" style="margin-top:12px">
+      <div class="progress-fill" id="progressFill" style="width:0%"></div>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="panel" id="resultsPanel" style="display:none">
+    <div class="panel-title">Results</div>
+    <div class="summary-grid">
+      <div class="metric">
+        <div class="metric-val" id="mRootAcc">—</div>
+        <div class="metric-label">Root accuracy</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val" id="mFullAcc">—</div>
+        <div class="metric-label">Full chord accuracy</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val" id="mLatency">—</div>
+        <div class="metric-label">Avg latency (ms)</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val" id="mSamples">—</div>
+        <div class="metric-label">Samples tested</div>
+      </div>
+    </div>
+    <table class="results-table">
+      <thead>
+        <tr>
+          <th>Sample</th>
+          <th>Expected</th>
+          <th>Detected</th>
+          <th>Root</th>
+          <th>Full chord</th>
+          <th>Latency</th>
+        </tr>
+      </thead>
+      <tbody id="resultsBody"></tbody>
+    </table>
+    <button class="export-btn" id="exportBtn">Export CSV</button>
+  </div>
+
+</div>
+
+<script>
+// ─── Ground truth definitions ────────────────────────────────────────────────
+// noteClass: the set of note names the detector should find (order doesn't matter)
+// root: the bass/fundamental note — easier target, always reported separately
+const GROUND_TRUTH = [
+  // Single notes
+  { label: 'E2 (low E string)',  root: 'E', noteClass: ['E'],        type: 'single' },
+  { label: 'A2 (A string)',      root: 'A', noteClass: ['A'],        type: 'single' },
+  { label: 'D3 (D string)',      root: 'D', noteClass: ['D'],        type: 'single' },
+  { label: 'G3 (G string)',      root: 'G', noteClass: ['G'],        type: 'single' },
+  { label: 'B3 (B string)',      root: 'B', noteClass: ['B'],        type: 'single' },
+  { label: 'E4 (high E string)', root: 'E', noteClass: ['E'],        type: 'single' },
+  // Open chords
+  { label: 'E major',  root: 'E', noteClass: ['E', 'G#', 'B'],      type: 'chord'  },
+  { label: 'A major',  root: 'A', noteClass: ['A', 'C#', 'E'],      type: 'chord'  },
+  { label: 'D major',  root: 'D', noteClass: ['D', 'F#', 'A'],      type: 'chord'  },
+  { label: 'G major',  root: 'G', noteClass: ['G', 'B', 'D'],       type: 'chord'  },
+  { label: 'C major',  root: 'C', noteClass: ['C', 'E', 'G'],       type: 'chord'  },
+  { label: 'E minor',  root: 'E', noteClass: ['E', 'G', 'B'],       type: 'chord'  },
+  { label: 'A minor',  root: 'A', noteClass: ['A', 'C', 'E'],       type: 'chord'  },
+  // Noisy environment versions (same chords, background noise present)
+  { label: 'E major (noisy)', root: 'E', noteClass: ['E', 'G#', 'B'], type: 'noisy' },
+  { label: 'A minor (noisy)', root: 'A', noteClass: ['A', 'C', 'E'],  type: 'noisy' },
+];
+
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+function freqToNoteName(freq) {
+  const midi = Math.round(12 * Math.log2(freq / 440) + 69);
+  return NOTE_NAMES[((midi % 12) + 12) % 12];
+}
+
+// ─── File loading ─────────────────────────────────────────────────────────────
+const audioBuffers = new Map(); // label → AudioBuffer
+
+function buildGroundTruthTable() {
+  const tbody = document.getElementById('gtBody');
+  GROUND_TRUTH.forEach((gt, i) => {
+    const tr = document.createElement('tr');
+    const noteTagsHtml = gt.noteClass.map(n =>
+      `<span class="tag tag-note">${n}</span>`).join('');
+    const typeColor = gt.type === 'single' ? '#2e1a47' : gt.type === 'noisy' ? '#2e2010' : '#1a1f2e';
+    tr.innerHTML = `
+      <td>${gt.label}</td>
+      <td>${noteTagsHtml}</td>
+      <td><span class="tag" style="background:${typeColor};color:var(--dim)">${gt.type}</span></td>
+      <td>
+        <label class="file-btn" id="fileBtn${i}" for="fileInput${i}">Choose file</label>
+        <input type="file" id="fileInput${i}" accept="audio/*" data-idx="${i}">
+      </td>
+      <td id="fileStatus${i}" style="color:var(--dim);font-size:11px">—</td>`;
+    tbody.appendChild(tr);
+
+    document.getElementById(`fileInput${i}`).addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      document.getElementById(`fileStatus${i}`).textContent = 'Loading...';
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const ctx = new AudioContext();
+        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        await ctx.close();
+        audioBuffers.set(gt.label, audioBuffer);
+        document.getElementById(`fileBtn${i}`).classList.add('loaded');
+        document.getElementById(`fileBtn${i}`).textContent = file.name.slice(0, 20);
+        document.getElementById(`fileStatus${i}`).textContent = `${audioBuffer.duration.toFixed(1)}s`;
+        document.getElementById(`fileStatus${i}`).style.color = 'var(--accent)';
+        updateRunButton();
+      } catch(err) {
+        document.getElementById(`fileStatus${i}`).textContent = 'Error decoding';
+        document.getElementById(`fileStatus${i}`).style.color = 'var(--err)';
+      }
+    });
+  });
+}
+
+function updateRunButton() {
+  const loaded = audioBuffers.size;
+  const runBtn = document.getElementById('runBtn');
+  runBtn.disabled = loaded === 0;
+  document.getElementById('statusText').textContent =
+    `${loaded} / ${GROUND_TRUTH.length} files loaded — ${loaded > 0 ? 'ready to run' : 'load audio files above'}`;
+}
+
+// ─── Detection engine (offline — no mic needed) ───────────────────────────────
+// Runs the same HPS algorithm offline on a decoded AudioBuffer.
+// Uses OfflineAudioContext so it processes faster than real-time.
+
+async function detectFromBuffer(audioBuffer) {
+  const FFT_SIZE    = 4096;
+  const HPS_ORDER   = 5;
+  const MIN_FREQ    = 60;
+  const MAX_FREQ    = 1400;
+  const PEAK_THRESH = 0.1;
+  const RMS_THRESH  = 0.01;
+  const TWO_PI      = 2 * Math.PI;
+  const sampleRate  = audioBuffer.sampleRate;
+
+  const data = audioBuffer.getChannelData(0);
+
+  // Hann window
+  const win = new Float32Array(FFT_SIZE);
+  for (let i = 0; i < FFT_SIZE; i++)
+    win[i] = 0.5 * (1 - Math.cos(TWO_PI * i / (FFT_SIZE - 1)));
+
+  const binHz   = sampleRate / FFT_SIZE;
+  const minBin  = Math.ceil(MIN_FREQ / binHz);
+  const maxBin  = Math.floor(MAX_FREQ / binHz);
+
+  // Collect detected notes across all analysis frames, then vote
+  const noteVotes = new Map(); // noteClass string → count
+  let frameCount = 0;
+
+  const hop = FFT_SIZE / 2; // 50% overlap
+  for (let start = 0; start + FFT_SIZE < data.length; start += hop) {
+    const frame = data.slice(start, start + FFT_SIZE);
+
+    // RMS gate
+    let sumSq = 0;
+    for (let i = 0; i < frame.length; i++) sumSq += frame[i] * frame[i];
+    const rms = Math.sqrt(sumSq / frame.length);
+    if (rms < RMS_THRESH) continue;
+
+    // Apply window
+    const windowed = new Float32Array(FFT_SIZE);
+    for (let i = 0; i < FFT_SIZE; i++) windowed[i] = frame[i] * win[i];
+
+    // FFT magnitude
+    const mag = fftMagnitude(windowed);
+
+    // HPS
+    const hps = new Float32Array(mag);
+    for (let h = 2; h <= HPS_ORDER; h++) {
+      for (let i = 0; i < hps.length; i++) {
+        const src = Math.floor(i * h);
+        hps[i] = src < mag.length ? hps[i] * mag[src] : 0;
+      }
+    }
+
+    // Peak picking
+    let globalMax = 0;
+    for (let i = minBin; i <= maxBin; i++) if (hps[i] > globalMax) globalMax = hps[i];
+    if (globalMax === 0) continue;
+
+    const thresh = globalMax * PEAK_THRESH;
+    const frameNotes = new Set();
+
+    for (let i = minBin + 1; i < maxBin - 1; i++) {
+      if (hps[i] > thresh && hps[i] > hps[i-1] && hps[i] > hps[i+1]) {
+        const alpha = hps[i-1], beta = hps[i], gamma = hps[i+1];
+        const offset = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma);
+        const freq = (i + offset) * binHz;
+        frameNotes.add(freqToNoteName(freq));
+      }
+    }
+
+    // Vote: for each note seen this frame, increment its counter
+    frameNotes.forEach(n => noteVotes.set(n, (noteVotes.get(n) || 0) + 1));
+    frameCount++;
+  }
+
+  if (frameCount === 0) return [];
+
+  // Only report notes that appeared in at least 30% of voiced frames
+  // (frames that passed the RMS gate) — same idea as persistence filter
+  const MIN_VOTE_FRAC = 0.30;
+  const detected = [];
+  noteVotes.forEach((count, note) => {
+    if (count / frameCount >= MIN_VOTE_FRAC) detected.push(note);
+  });
+
+  return detected;
+}
+
+// Cooley-Tukey FFT magnitude (same as hps-processor.js)
+function fftMagnitude(signal) {
+  const N  = signal.length;
+  const re = new Float32Array(signal);
+  const im = new Float32Array(N);
+  const TWO_PI = 2 * Math.PI;
+
+  let j = 0;
+  for (let i = 1; i < N; i++) {
+    let bit = N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let len = 2; len <= N; len <<= 1) {
+    const half = len >> 1;
+    const angle = -TWO_PI / len;
+    const wRe = Math.cos(angle), wIm = Math.sin(angle);
+    for (let i = 0; i < N; i += len) {
+      let cRe = 1, cIm = 0;
+      for (let k = 0; k < half; k++) {
+        const uRe = re[i+k], uIm = im[i+k];
+        const vRe = re[i+k+half]*cRe - im[i+k+half]*cIm;
+        const vIm = re[i+k+half]*cIm + im[i+k+half]*cRe;
+        re[i+k] = uRe+vRe; im[i+k] = uIm+vIm;
+        re[i+k+half] = uRe-vRe; im[i+k+half] = uIm-vIm;
+        const nr = cRe*wRe - cIm*wIm; cIm = cRe*wIm + cIm*wRe; cRe = nr;
+      }
+    }
+  }
+  const half = N >> 1;
+  const mag = new Float32Array(half);
+  for (let i = 0; i < half; i++) mag[i] = Math.sqrt(re[i]*re[i] + im[i]*im[i]);
+  return mag;
+}
+
+// ─── Benchmark runner ─────────────────────────────────────────────────────────
+let results = [];
+
+async function runBenchmark() {
+  const runBtn  = document.getElementById('runBtn');
+  const statusEl = document.getElementById('statusText');
+  const progress = document.getElementById('progressFill');
+  runBtn.disabled = true;
+  results = [];
+
+  const entries = [...audioBuffers.entries()];
+  for (let i = 0; i < entries.length; i++) {
+    const [label, buffer] = entries[i];
+    const gt = GROUND_TRUTH.find(g => g.label === label);
+    if (!gt) continue;
+
+    statusEl.textContent = `Analyzing ${label}...`;
+    progress.style.width = `${Math.round((i / entries.length) * 100)}%`;
+
+    const t0 = performance.now();
+    const detected = await detectFromBuffer(buffer);
+    const latency  = performance.now() - t0;
+
+    // Root correct: is the expected root note in detected set?
+    const rootCorrect = detected.includes(gt.root);
+
+    // Full chord correct: do detected notes cover all expected notes?
+    const fullCorrect = gt.noteClass.every(n => detected.includes(n));
+
+    results.push({ label, gt, detected, rootCorrect, fullCorrect, latency });
+  }
+
+  progress.style.width = '100%';
+  statusEl.textContent = `Done — ${results.length} samples analyzed`;
+  runBtn.disabled = false;
+  renderResults();
+}
+
+function renderResults() {
+  document.getElementById('resultsPanel').style.display = 'block';
+
+  const rootCorrect = results.filter(r => r.rootCorrect).length;
+  const fullCorrect = results.filter(r => r.fullCorrect).length;
+  const avgLatency  = results.reduce((s, r) => s + r.latency, 0) / results.length;
+  const n           = results.length;
+
+  const rootPct = Math.round(rootCorrect / n * 100);
+  const fullPct = Math.round(fullCorrect / n * 100);
+
+  function colorClass(pct) {
+    return pct >= 80 ? 'good' : pct >= 60 ? 'mid' : 'bad';
+  }
+
+  document.getElementById('mRootAcc').textContent  = `${rootPct}%`;
+  document.getElementById('mRootAcc').className    = `metric-val ${colorClass(rootPct)}`;
+  document.getElementById('mFullAcc').textContent  = `${fullPct}%`;
+  document.getElementById('mFullAcc').className    = `metric-val ${colorClass(fullPct)}`;
+  document.getElementById('mLatency').textContent  = `${avgLatency.toFixed(0)}ms`;
+  document.getElementById('mLatency').className    = 'metric-val good';
+  document.getElementById('mSamples').textContent  = n;
+  document.getElementById('mSamples').className    = 'metric-val';
+
+  const tbody = document.getElementById('resultsBody');
+  tbody.innerHTML = '';
+  results.forEach(r => {
+    const tr = document.createElement('tr');
+    const detectedHtml = r.detected.length
+      ? r.detected.map(n => `<span class="tag tag-note">${n}</span>`).join('')
+      : '<span style="color:var(--err)">none</span>';
+    const expectedHtml = r.gt.noteClass.map(n => `<span class="tag tag-note">${n}</span>`).join('');
+    tr.innerHTML = `
+      <td>${r.label}</td>
+      <td>${expectedHtml}</td>
+      <td>${detectedHtml}</td>
+      <td class="${r.rootCorrect ? 'pass' : 'fail'}">${r.rootCorrect ? '✓' : '✗'}</td>
+      <td class="${r.fullCorrect ? 'pass' : r.rootCorrect ? 'partial' : 'fail'}">
+        ${r.fullCorrect ? '✓' : r.rootCorrect ? '~' : '✗'}
+      </td>
+      <td>${r.latency.toFixed(1)}ms</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+// ─── Export CSV ───────────────────────────────────────────────────────────────
+document.getElementById('exportBtn')?.addEventListener('click', () => {
+  if (!results.length) return;
+  const rows = [
+    ['Sample', 'Expected', 'Detected', 'Root Correct', 'Full Chord Correct', 'Latency (ms)'],
+    ...results.map(r => [
+      r.label,
+      r.gt.noteClass.join('+'),
+      r.detected.join('+'),
+      r.rootCorrect ? 'YES' : 'NO',
+      r.fullCorrect ? 'YES' : 'NO',
+      r.latency.toFixed(1),
+    ])
+  ];
+  const csv = rows.map(r => r.join(',')).join('\n');
+  const a   = Object.assign(document.createElement('a'), {
+    href:     URL.createObjectURL(new Blob([csv], { type: 'text/csv' })),
+    download: 'chladni-benchmark.csv',
+  });
+  a.click();
+});
+
+document.getElementById('runBtn').addEventListener('click', runBenchmark);
+document.getElementById('clearBtn').addEventListener('click', () => {
+  results = [];
+  document.getElementById('resultsPanel').style.display = 'none';
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('statusText').textContent = `${audioBuffers.size} files loaded — ready to run`;
+});
+
+buildGroundTruthTable();
+</script>
+</body>
+</html>
